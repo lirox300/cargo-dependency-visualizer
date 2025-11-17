@@ -48,9 +48,9 @@ def validate_arguments(args):
     if not args.repo_url.strip():
         errors.append("URL репозитория не может быть пустым")
     elif args.test_mode:
-        if not os.path.isdir(args.repo_url):
+        if not (os.path.isdir(args.repo_url) or os.path.isfile(args.repo_url)):
             errors.append(
-                f"В тестовом режиме путь '{args.repo_url}' не существует или не является директорией."
+                f"В тестовом режиме путь '{args.repo_url}' не существует как директория или файл."
             )
     if errors:
         print("Ошибки валидации:")
@@ -109,6 +109,63 @@ def extract_dependencies(cargo_path):
         print(f"Ошибка при чтении {cargo_path}: {e}", file=sys.stderr)
     return deps
 
+def load_test_graph(file_path):
+    graph = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(':', 1)
+            package = parts[0].strip()
+            if len(parts) > 1:
+                deps = parts[1].strip().split()
+            else:
+                deps = []
+            graph[package] = deps
+    return graph
+
+def build_graph_dfs(start_package, repo_path, filter_substr, test_mode):
+    graph = {}
+    visited = set()
+    visiting = set()
+    cycles = []
+    stack = [(start_package, False)]
+    test_graph = None
+    if test_mode and os.path.isfile(repo_path):
+        test_graph = load_test_graph(repo_path)
+    while stack:
+        pkg, expanded = stack.pop()
+        if filter_substr and filter_substr in pkg:
+            continue
+        if not expanded:
+            if pkg in visited:
+                continue
+            stack.append((pkg, True))
+            visiting.add(pkg)
+            if test_graph:
+                deps = test_graph.get(pkg, [])
+            else:
+                cargo_file = find_cargo_toml(pkg, repo_path)
+                if cargo_file:
+                    deps = extract_dependencies(cargo_file)
+                else:
+                    deps = []
+            filtered_deps = []
+            for dep in deps:
+                if not (filter_substr and filter_substr in dep):
+                    filtered_deps.append(dep)
+            graph[pkg] = filtered_deps
+            for dep in filtered_deps:
+                if dep in visiting:
+                    cycles.append((pkg, dep))
+                elif dep not in visited:
+                    stack.append((dep, False))
+        else:
+            visiting.discard(pkg)
+            visited.add(pkg)
+    return graph, cycles
+
 def main():
     args = parse_arguments()
     if not validate_arguments(args):
@@ -129,16 +186,23 @@ def main():
                 sys.exit(1)
         else:
             repo_path = args.repo_url
-        cargo_file = find_cargo_toml(args.package, repo_path)
-        if not cargo_file:
-            print(f"Cargo.toml с пакетом '{args.package}' не найден в репозитории.", file=sys.stderr)
+        graph, cycles = build_graph_dfs(args.package, repo_path, args.filter, args.test_mode)
+        if not graph or args.package not in graph:
+            print(f"Пакет '{args.package}' не найден.", file=sys.stderr)
             sys.exit(1)
-        dependencies = extract_dependencies(cargo_file)
-        if dependencies:
-            for name in dependencies:
-                print(name)
-        else:
-            print("Не найдено прямых зависимостей в секции [dependencies].")
+        if cycles:
+            print("\nОбнаружены циклические зависимости:")
+            for from_pkg, to_pkg in cycles:
+                print(f"  {from_pkg} -> {to_pkg} (цикл)")
+        print(f"\nГраф зависимостей для пакета '{args.package}':")
+        for pkg in sorted(graph.keys()):
+            deps = graph[pkg]
+            if deps:
+                print(f"  {pkg} -> {', '.join(deps)}")
+            else:
+                print(f"  {pkg}")
+        if args.filter:
+            print(f"\n(Пакеты, содержащие '{args.filter}', исключены)")
     finally:
         if temp_root and os.path.isdir(temp_root):
             shutil.rmtree(temp_root, ignore_errors=True)
