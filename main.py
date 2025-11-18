@@ -2,9 +2,10 @@ import argparse
 import sys
 import os
 import tempfile
-import subprocess
 import shutil
-import re
+import tarfile
+import urllib.request
+import json
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -21,7 +22,7 @@ def parse_arguments():
         '--repo-url',
         type=str,
         required=True,
-        help='URL-адрес репозитория или путь к файлу тестового репозитория'
+        help='URL-адрес пакета на crates.io'
     )
     parser.add_argument(
         '--test-mode',
@@ -43,14 +44,20 @@ def parse_arguments():
 
 def validate_arguments(args):
     errors = []
-    if not args.package.strip():
-        errors.append("Имя пакета не может быть пустым")
-    if not args.repo_url.strip():
+    repo_url = args.repo_url.strip()
+    package = args.package.strip()
+    if not repo_url:
         errors.append("URL репозитория не может быть пустым")
-    elif args.test_mode:
-        if not (os.path.isdir(args.repo_url) or os.path.isfile(args.repo_url)):
+    elif not repo_url.startswith("https://crates.io/crates/"):
+        errors.append("Ссылка должна быть вида https://crates.io/crates/<имя_пакета>")
+    if not package:
+        errors.append("Имя пакета не может быть пустым")
+    if repo_url and package and repo_url.startswith("https://crates.io/crates/"):
+        crate_name_from_url = repo_url.rstrip('/').split('/')[-1]
+        if crate_name_from_url != package:
             errors.append(
-                f"В тестовом режиме путь '{args.repo_url}' не существует как директория или файл."
+                f"Имя пакета в URL ({crate_name_from_url}) "
+                f"не совпадает с --package ({package})"
             )
     if errors:
         print("Ошибки валидации:")
@@ -59,153 +66,122 @@ def validate_arguments(args):
         return False
     return True
 
+def get_latest_version(crate_name):
+    api_url = f"https://crates.io/api/v1/crates/{crate_name}"
+    try:
+        with urllib.request.urlopen(api_url) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"Не удалось получить информацию о крейте {crate_name}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    crate_info = data.get("crate", {})
+    version = crate_info.get("max_stable_version") or crate_info.get("max_version")
+    if not version:
+        print(f"Не удалось определить последнюю версию крейта {crate_name}",
+              file=sys.stderr)
+        sys.exit(1)
+    return version
+
+def download_and_unpack(crate_name, version, dest_dir):
+    download_url = f"https://crates.io/api/v1/crates/{crate_name}/{version}/download"
+    crate_file = os.path.join(dest_dir, f"{crate_name}-{version}.crate")
+    try:
+        with urllib.request.urlopen(download_url) as resp, open(crate_file, "wb") as f:
+            shutil.copyfileobj(resp, f)
+    except Exception as e:
+        print(f"Не удалось скачать крейт {crate_name} {version}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        with tarfile.open(crate_file, "r:gz") as tar:
+            tar.extractall(dest_dir)
+    except Exception as e:
+        print(f"Не удалось распаковать архив {crate_file}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    return dest_dir
+
 def find_cargo_toml(package_name, start_path):
-    name_re = re.compile(r'^\s*name\s*=\s*["\'](.+?)["\']\s*(?:#.*)?$')
     for root, dirs, files in os.walk(start_path):
-        if 'Cargo.toml' in files:
-            cargo_path = os.path.join(root, 'Cargo.toml')
-            try:
-                with open(cargo_path, 'r', encoding='utf-8') as f:
-                    in_package = False
-                    for raw in f:
-                        line = raw.strip()
-                        if line == '[package]':
-                            in_package = True
-                            continue
-                        if in_package and line.startswith('['):
-                            break
-                        if in_package:
-                            m = name_re.match(line)
-                            if m:
-                                name_val = m.group(1)
-                                if name_val == package_name:
-                                    return cargo_path
-                                break
-            except Exception:
-                continue
+        if 'Cargo.toml' not in files:
+            continue
+        cargo_path = os.path.join(root, 'Cargo.toml')
+        try:
+            with open(cargo_path, 'r', encoding='utf-8') as f:
+                in_package = False
+                for raw in f:
+                    line = raw.strip()
+                    if line == '[package]':
+                        in_package = True
+                        continue
+                    if in_package and line.startswith('['):
+                        break
+                    if in_package and line.startswith('name'):
+                        if '=' in line:
+                            _, value = line.split('=', 1)
+                            name_val = value.strip().strip('"\'')
+                            if name_val == package_name:
+                                return cargo_path
+                        break
+        except Exception:
+            continue
     return None
 
 def extract_dependencies(cargo_path):
-    deps = []
-    name_re = re.compile(r'^\s*([^=\s]+)\s*=.*$')
+    deps = set()
     try:
         with open(cargo_path, 'r', encoding='utf-8') as f:
-            in_deps = False
+            in_deps_block = False
             for raw in f:
                 line = raw.strip()
-                if not in_deps:
-                    if line == '[dependencies]':
-                        in_deps = True
-                    continue
-                if line.startswith('['):
-                    break
                 if not line or line.startswith('#'):
                     continue
-                m = name_re.match(line)
-                if m:
-                    name = m.group(1).strip()
-                    deps.append(name)
+                if line.startswith('[') and line.endswith(']'):
+                    section = line[1:-1].strip()
+                    if section == 'dependencies':
+                        in_deps_block = True
+                    else:
+                        dep_name = ''
+                        if section.startswith('dependencies.'):
+                            dep_name = section[len('dependencies.'):].strip()
+                        elif '.dependencies.' in section:
+                            dep_name = section.split('.dependencies.', 1)[1].strip()
+                        if dep_name:
+                            deps.add(dep_name)
+                        in_deps_block = False
+                    continue
+                if in_deps_block:
+                    if '=' in line:
+                        dep_name = line.split('=', 1)[0].strip()
+                        if dep_name:
+                            deps.add(dep_name)
     except Exception as e:
         print(f"Ошибка при чтении {cargo_path}: {e}", file=sys.stderr)
-    return deps
-
-def load_test_graph(file_path):
-    graph = {}
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(':', 1)
-            package = parts[0].strip()
-            if len(parts) > 1:
-                deps = parts[1].strip().split()
-            else:
-                deps = []
-            graph[package] = deps
-    return graph
-
-def build_graph_dfs(start_package, repo_path, filter_substr, test_mode):
-    graph = {}
-    visited = set()
-    visiting = set()
-    cycles = []
-    stack = [(start_package, False)]
-    test_graph = None
-    if test_mode and os.path.isfile(repo_path):
-        test_graph = load_test_graph(repo_path)
-    while stack:
-        pkg, expanded = stack.pop()
-        if filter_substr and filter_substr in pkg:
-            continue
-        if not expanded:
-            if pkg in visited:
-                continue
-            stack.append((pkg, True))
-            visiting.add(pkg)
-            if test_graph:
-                deps = test_graph.get(pkg, [])
-            else:
-                cargo_file = find_cargo_toml(pkg, repo_path)
-                if cargo_file:
-                    deps = extract_dependencies(cargo_file)
-                else:
-                    deps = []
-            filtered_deps = []
-            for dep in deps:
-                if not (filter_substr and filter_substr in dep):
-                    filtered_deps.append(dep)
-            graph[pkg] = filtered_deps
-            for dep in filtered_deps:
-                if dep in visiting:
-                    cycles.append((pkg, dep))
-                elif dep not in visited:
-                    stack.append((dep, False))
-        else:
-            visiting.discard(pkg)
-            visited.add(pkg)
-    return graph, cycles
+    return sorted(deps)
 
 def main():
     args = parse_arguments()
     if not validate_arguments(args):
         sys.exit(1)
-    repo_path = None
-    temp_root = None
+    crate_name = args.package
+    temp_root = tempfile.mkdtemp(prefix="crate_download_")
     try:
-        if not args.test_mode:
-            temp_root = tempfile.mkdtemp(prefix="repo_clone_")
-            repo_path = os.path.join(temp_root, "repo")
-            try:
-                result = subprocess.run(["git", "clone", args.repo_url, repo_path], capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"Ошибка клонирования репозитория: {result.stderr.strip()}", file=sys.stderr)
-                    sys.exit(1)
-            except FileNotFoundError:
-                print("Git не найден. Установите Git и повторите попытку.", file=sys.stderr)
-                sys.exit(1)
-        else:
-            repo_path = args.repo_url
-        graph, cycles = build_graph_dfs(args.package, repo_path, args.filter, args.test_mode)
-        if not graph or args.package not in graph:
-            print(f"Пакет '{args.package}' не найден.", file=sys.stderr)
+        version = get_latest_version(crate_name)
+        work_dir = download_and_unpack(crate_name, version, temp_root)
+        cargo_file = find_cargo_toml(crate_name, work_dir)
+        if not cargo_file:
+            print(f"Cargo.toml с пакетом '{crate_name}' не найден в распакованном крейте.",
+                  file=sys.stderr)
             sys.exit(1)
-        if cycles:
-            print("\nОбнаружены циклические зависимости:")
-            for from_pkg, to_pkg in cycles:
-                print(f"  {from_pkg} -> {to_pkg} (цикл)")
-        print(f"\nГраф зависимостей для пакета '{args.package}':")
-        for pkg in sorted(graph.keys()):
-            deps = graph[pkg]
-            if deps:
-                print(f"  {pkg} -> {', '.join(deps)}")
-            else:
-                print(f"  {pkg}")
-        if args.filter:
-            print(f"\n(Пакеты, содержащие '{args.filter}', исключены)")
+        dependencies = extract_dependencies(cargo_file)
+        if dependencies:
+            for name in dependencies:
+                print(name)
+        else:
+            print("Не найдено прямых зависимостей пакета.")
     finally:
-        if temp_root and os.path.isdir(temp_root):
-            shutil.rmtree(temp_root, ignore_errors=True)
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 if __name__ == "__main__":
     main()
